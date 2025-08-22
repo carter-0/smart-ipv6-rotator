@@ -105,6 +105,7 @@ def run(
     interface: str | None = None,
     gateway: str | None = None,
     fast: bool = False,
+    fast_unsafe: bool = False,
 ) -> None:
     """Run the IPv6 rotator process."""
 
@@ -119,10 +120,12 @@ def run(
             "Running without checking if the IPv6 address configured will work properly."
         )
 
-    if fast:
-        LOGGER.info(
-            "Fast mode enabled - using aggressive optimizations for minimal delays"
-        )
+    # Handle fast mode flags
+    if fast_unsafe:
+        fast = True  # fast_unsafe implies fast
+        LOGGER.info("ULTRA fast mode enabled - disabling DAD for maximum speed (may cause issues)")
+    elif fast:
+        LOGGER.info("Fast mode enabled - using aggressive optimizations for minimal delays")
 
     root_check(skip_root)
     check_ipv6_connectivity()
@@ -176,6 +179,26 @@ def run(
     for key, value in asdict(saved_ranges).items():
         LOGGER.debug(f"{key} --> {value}")
 
+    # Disable DAD if fast_unsafe mode
+    if fast_unsafe:
+        try:
+            import subprocess
+            # Disable DAD on the interface
+            subprocess.run(
+                ["sysctl", "-w", f"net.ipv6.conf.{default_interface_name}.accept_dad=0"],
+                check=False,
+                capture_output=True
+            )
+            # Also try optimistic DAD as fallback
+            subprocess.run(
+                ["sysctl", "-w", f"net.ipv6.conf.{default_interface_name}.optimistic_dad=1"],
+                check=False,
+                capture_output=True
+            )
+            LOGGER.debug(f"Disabled DAD on {default_interface_name}")
+        except Exception as e:
+            LOGGER.debug(f"Could not disable DAD: {e}")
+
     try:
         IPROUTE.addr(
             "add",
@@ -194,15 +217,27 @@ def run(
 
     if fast:
         # In fast mode, wait for address to become ready (non-tentative)
-        if not wait_for_address_ready(
-            default_interface_index,
-            random_ipv6_address,
-            timeout=2.0,
-            poll_interval=0.05,
-        ):
-            clean_ranges(service_ranges, skip_root, fast_mode=fast)
-            LOGGER.error("IPv6 address did not become ready within timeout period")
-            sys.exit()
+        if fast_unsafe:
+            # With DAD disabled, address should be ready almost immediately
+            if not wait_for_address_ready(
+                default_interface_index,
+                random_ipv6_address,
+                timeout=0.5,
+                poll_interval=0.01,
+            ):
+                # If not ready in 500ms with DAD disabled, just continue anyway
+                LOGGER.debug("Address not confirmed ready but continuing (DAD disabled)")
+        else:
+            # Normal fast mode - wait up to 2s for DAD to complete
+            if not wait_for_address_ready(
+                default_interface_index,
+                random_ipv6_address,
+                timeout=2.0,
+                poll_interval=0.05,
+            ):
+                clean_ranges(service_ranges, skip_root, fast_mode=fast)
+                LOGGER.error("IPv6 address did not become ready within timeout period")
+                sys.exit()
     else:
         sleep(2)  # Need so that the linux kernel takes into account the new ipv6 route
 
@@ -322,7 +357,10 @@ def run(
         "Successful setup. Waiting for the propagation in the Linux kernel."
     )
 
-    if fast:
+    if fast_unsafe:
+        # In ultra-fast mode, almost no delay needed
+        sleep(0.05)  # 50ms minimal delay
+    elif fast:
         # In fast mode, minimal delay for kernel propagation
         sleep(0.2)  # 200ms should be sufficient
     else:
@@ -393,6 +431,12 @@ def main() -> None:
         "--fast",
         action="store_true",
         help="Enable aggressive optimization for faster rotation (minimal delays, active polling).",
+        required=False,
+    )
+    run_parser.add_argument(
+        "--fast-unsafe",
+        action="store_true",
+        help="Enable ULTRA aggressive optimization (disables DAD, may cause issues on shared networks).",
         required=False,
     )
     run_parser.set_defaults(func=run)

@@ -267,7 +267,7 @@ def clean_ranges(ranges_: list[str], skip_root: bool, fast_mode: bool = False) -
 
     # In fast mode, use minimal delay
     if fast_mode:
-        sleep(0.5)  # 500ms should be enough for kernel cleanup
+        sleep(0.1)  # 100ms should be enough for kernel cleanup
     else:
         sleep(6)
 
