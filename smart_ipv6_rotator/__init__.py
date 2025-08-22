@@ -5,7 +5,7 @@ from dataclasses import asdict
 from ipaddress import IPv6Address, IPv6Network
 from os import path
 from random import choice, getrandbits, seed
-from time import sleep
+from time import sleep, time
 from typing import Any, Callable
 
 import requests
@@ -106,8 +106,12 @@ def run(
     gateway: str | None = None,
     fast: bool = False,
     fast_unsafe: bool = False,
+    ultra: bool = False,
 ) -> None:
     """Run the IPv6 rotator process."""
+    
+    if ultra:
+        start_time = time()
 
     if path.exists(LEGACY_CONFIG_FILE):
         LOGGER.error(
@@ -121,18 +125,30 @@ def run(
         )
 
     # Handle fast mode flags
-    if fast_unsafe:
+    if ultra:
+        fast_unsafe = True
+        fast = True
+        cron = True  # Skip connectivity check
+        LOGGER.setLevel(logging.WARNING)  # Reduce logging overhead
+        LOGGER.info("ULTRA MODE: Maximum speed, skipping ALL safety checks!")
+    elif fast_unsafe:
         fast = True  # fast_unsafe implies fast
         LOGGER.info("ULTRA fast mode enabled - disabling DAD for maximum speed (may cause issues)")
     elif fast:
         LOGGER.info("Fast mode enabled - using aggressive optimizations for minimal delays")
 
     root_check(skip_root)
-    check_ipv6_connectivity()
+    
+    if not ultra:  # Skip connectivity check in ultra mode
+        check_ipv6_connectivity()
 
     service_ranges = what_ranges(services, external_ipv6_ranges, no_services)
 
-    clean_ranges(service_ranges, skip_root, fast_mode=fast)
+    # Skip cleanup in ultra mode for maximum speed
+    if not ultra:
+        clean_ranges(service_ranges, skip_root, fast_mode=fast)
+    else:
+        LOGGER.debug("Skipping cleanup in ultra mode")
 
     seed()
     ipv6_network = IPv6Network(ipv6range)
@@ -215,7 +231,10 @@ def run(
         )
         sys.exit()
 
-    if fast:
+    if ultra:
+        # Ultra mode: Skip all waiting, assume it works
+        LOGGER.debug("Ultra mode: Skipping address readiness check")
+    elif fast:
         # In fast mode, wait for address to become ready (non-tentative)
         if fast_unsafe:
             # With DAD disabled, address should be ready almost immediately
@@ -241,7 +260,7 @@ def run(
     else:
         sleep(2)  # Need so that the linux kernel takes into account the new ipv6 route
 
-    if cron is False:
+    if cron is False and not ultra:  # Skip verification in ultra mode
         try:
             IPROUTE.route(
                 "add",
@@ -357,7 +376,11 @@ def run(
         "Successful setup. Waiting for the propagation in the Linux kernel."
     )
 
-    if fast_unsafe:
+    if ultra:
+        # Ultra mode: NO DELAY AT ALL!
+        elapsed = time() - start_time
+        LOGGER.warning(f"ULTRA MODE COMPLETE in {elapsed:.3f}s - IP: {random_ipv6_address}")
+    elif fast_unsafe:
         # In ultra-fast mode, almost no delay needed
         sleep(0.05)  # 50ms minimal delay
     elif fast:
@@ -437,6 +460,12 @@ def main() -> None:
         "--fast-unsafe",
         action="store_true",
         help="Enable ULTRA aggressive optimization (disables DAD, may cause issues on shared networks).",
+        required=False,
+    )
+    run_parser.add_argument(
+        "--ultra",
+        action="store_true",
+        help="MAXIMUM SPEED: Skip ALL safety checks, no delays, no cleanup. USE AT YOUR OWN RISK!",
         required=False,
     )
     run_parser.set_defaults(func=run)
