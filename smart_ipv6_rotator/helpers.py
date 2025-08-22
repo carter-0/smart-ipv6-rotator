@@ -1,8 +1,9 @@
 import json
 import os
+import socket
 import sys
 from dataclasses import asdict
-from time import sleep
+from time import sleep, monotonic
 from typing import Iterator
 
 import requests
@@ -13,6 +14,9 @@ from smart_ipv6_rotator.const import (
     IPROUTE,
     JSON_CONFIG_FILE,
     LOGGER,
+    IPBatch,
+    IFA_F_TENTATIVE,
+    IFA_FLAGS,
 )
 from smart_ipv6_rotator.models import SavedRanges
 from smart_ipv6_rotator.ranges import RANGES
@@ -87,12 +91,130 @@ def clean_ipv6_check(config: SavedRanges) -> None:
         pass
 
 
-def clean_ranges(ranges_: list[str], skip_root: bool) -> None:
+def wait_for_address_ready(
+    interface_index: int, 
+    ipv6_address: str, 
+    timeout: float = 2.0,
+    poll_interval: float = 0.05
+) -> bool:
+    """
+    Wait for an IPv6 address to become ready (non-tentative).
+    
+    Args:
+        interface_index: Network interface index
+        ipv6_address: The IPv6 address to check
+        timeout: Maximum time to wait in seconds
+        poll_interval: Time between checks in seconds
+        
+    Returns:
+        True if address becomes ready, False if timeout reached
+    """
+    start_time = monotonic()
+    deadline = start_time + timeout
+    
+    while monotonic() < deadline:
+        try:
+            # Get all IPv6 addresses on the interface
+            addrs = IPROUTE.get_addr(
+                index=interface_index, 
+                family=socket.AF_INET6
+            )
+            
+            for msg in addrs:
+                attrs = dict(msg.get('attrs', []))
+                # Check if this is our address
+                if attrs.get('IFA_ADDRESS') == ipv6_address:
+                    # Check if tentative flag is set
+                    flags = msg.get(IFA_FLAGS, 0)
+                    if not (flags & IFA_F_TENTATIVE):
+                        elapsed = monotonic() - start_time
+                        LOGGER.debug(f"Address {ipv6_address} ready after {elapsed:.2f}s")
+                        return True
+                        
+        except Exception as e:
+            LOGGER.debug(f"Error checking address status: {e}")
+            
+        sleep(poll_interval)
+    
+    LOGGER.warning(f"Address {ipv6_address} still tentative after {timeout}s timeout")
+    return False
+
+
+def batch_add_routes(
+    routes: list[dict],
+    commit_timeout: float = 5.0
+) -> bool:
+    """
+    Add multiple routes in a single batch operation.
+    
+    Args:
+        routes: List of route dictionaries with keys matching IPRoute.route() params
+        commit_timeout: Timeout for batch commit operation
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        with IPBatch(commit_timeout=commit_timeout) as batch:
+            for route_params in routes:
+                batch.route('add', **route_params)
+        LOGGER.debug(f"Successfully added {len(routes)} routes in batch")
+        return True
+    except Exception as e:
+        LOGGER.error(f"Failed to add routes in batch: {e}")
+        return False
+
+
+def quick_ipv6_check(
+    ipv6_address: str,
+    timeout: float = 2.0,
+    retry_count: int = 1,
+    retry_delay: float = 0.1
+) -> bool:
+    """
+    Quickly verify that the new IPv6 address is being used.
+    
+    Args:
+        ipv6_address: The IPv6 address to verify
+        timeout: Request timeout in seconds
+        retry_count: Number of retries if first attempt fails
+        retry_delay: Delay between retries in seconds
+        
+    Returns:
+        True if verification successful, False otherwise
+    """
+    for attempt in range(retry_count + 1):
+        try:
+            response = requests.get(
+                f"http://[{ICANHAZIP_IPV6_ADDRESS}]",
+                headers={"host": "ipv6.icanhazip.com"},
+                timeout=timeout
+            )
+            response.raise_for_status()
+            
+            returned_ip = response.text.strip()
+            if returned_ip == ipv6_address:
+                LOGGER.debug(f"IPv6 verification successful on attempt {attempt + 1}")
+                return True
+            else:
+                LOGGER.warning(f"Unexpected IP returned: {returned_ip} != {ipv6_address}")
+                
+        except requests.exceptions.RequestException as e:
+            LOGGER.debug(f"IPv6 check attempt {attempt + 1} failed: {e}")
+            
+        if attempt < retry_count:
+            sleep(retry_delay)
+    
+    return False
+
+
+def clean_ranges(ranges_: list[str], skip_root: bool, fast_mode: bool = False) -> None:
     """Cleans root.
 
     Args:
         ranges_ (list[str]):
         skip_root (bool):
+        fast_mode (bool): Use minimal delays for faster cleanup
     """
 
     root_check(skip_root)
@@ -137,7 +259,11 @@ def clean_ranges(ranges_: list[str], skip_root: bool) -> None:
         "Finished cleaning up previous setup.\nWaiting for the propagation in the Linux kernel."
     )
 
-    sleep(6)
+    # In fast mode, use minimal delay
+    if fast_mode:
+        sleep(0.5)  # 500ms should be enough for kernel cleanup
+    else:
+        sleep(6)
 
 
 def previous_configs() -> Iterator[SavedRanges]:

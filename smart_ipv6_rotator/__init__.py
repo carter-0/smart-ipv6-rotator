@@ -21,11 +21,14 @@ from smart_ipv6_rotator.const import (
 from smart_ipv6_rotator.helpers import (
     PreviousConfig,
     SavedRanges,
+    batch_add_routes,
     check_ipv6_connectivity,
     clean_ipv6_check,
     clean_ranges,
     previous_configs,
+    quick_ipv6_check,
     root_check,
+    wait_for_address_ready,
     what_ranges,
 )
 from smart_ipv6_rotator.ranges import RANGES
@@ -101,6 +104,7 @@ def run(
     cron: bool = False,
     interface: str | None = None,
     gateway: str | None = None,
+    fast: bool = False,
 ) -> None:
     """Run the IPv6 rotator process."""
 
@@ -115,12 +119,17 @@ def run(
             "Running without checking if the IPv6 address configured will work properly."
         )
 
+    if fast:
+        LOGGER.info(
+            "Fast mode enabled - using aggressive optimizations for minimal delays"
+        )
+
     root_check(skip_root)
     check_ipv6_connectivity()
 
     service_ranges = what_ranges(services, external_ipv6_ranges, no_services)
 
-    clean_ranges(service_ranges, skip_root)
+    clean_ranges(service_ranges, skip_root, fast_mode=fast)
 
     seed()
     ipv6_network = IPv6Network(ipv6range)
@@ -134,17 +143,17 @@ def run(
     if interface and gateway:
         default_interface_name = interface
         default_interface_gateway = gateway
-        
+
         if interface not in IP.interfaces:
             LOGGER.error(f"Specified interface '{interface}' not found.")
             sys.exit()
-            
+
         default_interface_index = IP.interfaces[interface]["index"]
     else:
         if interface or gateway:
             LOGGER.error("Both --interface and --gateway must be specified together.")
             sys.exit()
-            
+
         default_interface = IPROUTE.route("get", dst=choice(service_ranges))[0]  # type: ignore
         default_interface_index = int(default_interface.get_attrs("RTA_OIF")[0])
         default_interface_gateway = str(default_interface.get_attrs("RTA_GATEWAY")[0])
@@ -175,7 +184,7 @@ def run(
             mask=ipv6_network.prefixlen,
         )
     except Exception as error:
-        clean_ranges(service_ranges, skip_root)
+        clean_ranges(service_ranges, skip_root, fast_mode=fast)
         LOGGER.error(
             "Failed to add the new random IPv6 address. The setup did not work!\n"
             "That's unexpected! Did you correctly configure the IPv6 subnet to use?\n"
@@ -183,10 +192,21 @@ def run(
         )
         sys.exit()
 
-    sleep(2)  # Need so that the linux kernel takes into account the new ipv6 route
+    if fast:
+        # In fast mode, wait for address to become ready (non-tentative)
+        if not wait_for_address_ready(
+            default_interface_index,
+            random_ipv6_address,
+            timeout=2.0,
+            poll_interval=0.05,
+        ):
+            clean_ranges(service_ranges, skip_root, fast_mode=fast)
+            LOGGER.error("IPv6 address did not become ready within timeout period")
+            sys.exit()
+    else:
+        sleep(2)  # Need so that the linux kernel takes into account the new ipv6 route
 
     if cron is False:
-
         try:
             IPROUTE.route(
                 "add",
@@ -197,78 +217,116 @@ def run(
                 priority=1,
             )
         except Exception as error:
-            clean_ranges(service_ranges, skip_root)
+            clean_ranges(service_ranges, skip_root, fast_mode=fast)
             LOGGER.error(
                 "Failed to configure the test IPv6 route. The setup did not work!\n"
                 f"       Exception:\n{error}"
             )
             sys.exit()
 
-        sleep(4)
-
-        try:
-            check_new_ipv6_address = requests.get(
-                f"http://[{ICANHAZIP_IPV6_ADDRESS}]",
-                headers={"host": "ipv6.icanhazip.com"},
-                timeout=5,
-            )
-        except requests.exceptions.RequestException as error:
-            clean_ranges(service_ranges, skip_root)
-            LOGGER.error(
-                "Failed to send the request for checking the new IPv6 address! The setup did not work!\n"
-                "Your provider probably does not allow setting any arbitrary IPv6 address.\n"
-                "Or did you correctly configure the IPv6 subnet to use?\n"
-                f"Exception:\n{error}"
-            )
-            sys.exit()
-
-        try:
-            check_new_ipv6_address.raise_for_status()
-        except requests.HTTPError:
-            clean_ranges(service_ranges, skip_root)
-            LOGGER.error(
-                "icanhazip didn't return the expected status, possibly they are down right now."
-            )
-            sys.exit()
-
-        response_new_ipv6_address = check_new_ipv6_address.text.strip()
-        if response_new_ipv6_address == random_ipv6_address:
+        if fast:
+            # In fast mode, immediately check without delay
+            if not quick_ipv6_check(
+                random_ipv6_address, timeout=2.0, retry_count=1, retry_delay=0.1
+            ):
+                clean_ranges(service_ranges, skip_root, fast_mode=fast)
+                LOGGER.error(
+                    "Failed to verify new IPv6 address! The setup did not work!\n"
+                    "Your provider probably does not allow setting any arbitrary IPv6 address.\n"
+                    "Or did you correctly configure the IPv6 subnet to use?"
+                )
+                sys.exit()
             LOGGER.info("Correctly using the new random IPv6 address, continuing.")
         else:
-            clean_ranges(service_ranges, skip_root)
-            LOGGER.error(
-                "The new random IPv6 is not used! The setup did not work!\n"
-                "That is very unexpected, check if your IPv6 routes do not have too much priority."
-                f"Address used: {response_new_ipv6_address}"
-            )
-            sys.exit()
+            sleep(4)
+
+            try:
+                check_new_ipv6_address = requests.get(
+                    f"http://[{ICANHAZIP_IPV6_ADDRESS}]",
+                    headers={"host": "ipv6.icanhazip.com"},
+                    timeout=5,
+                )
+            except requests.exceptions.RequestException as error:
+                clean_ranges(service_ranges, skip_root, fast_mode=fast)
+                LOGGER.error(
+                    "Failed to send the request for checking the new IPv6 address! The setup did not work!\n"
+                    "Your provider probably does not allow setting any arbitrary IPv6 address.\n"
+                    "Or did you correctly configure the IPv6 subnet to use?\n"
+                    f"Exception:\n{error}"
+                )
+                sys.exit()
+
+            try:
+                check_new_ipv6_address.raise_for_status()
+            except requests.HTTPError:
+                clean_ranges(service_ranges, skip_root, fast_mode=fast)
+                LOGGER.error(
+                    "icanhazip didn't return the expected status, possibly they are down right now."
+                )
+                sys.exit()
+
+            response_new_ipv6_address = check_new_ipv6_address.text.strip()
+            if response_new_ipv6_address == random_ipv6_address:
+                LOGGER.info("Correctly using the new random IPv6 address, continuing.")
+            else:
+                clean_ranges(service_ranges, skip_root, fast_mode=fast)
+                LOGGER.error(
+                    "The new random IPv6 is not used! The setup did not work!\n"
+                    "That is very unexpected, check if your IPv6 routes do not have too much priority."
+                    f"Address used: {response_new_ipv6_address}"
+                )
+                sys.exit()
 
         clean_ipv6_check(saved_ranges)
 
-    try:
-        for ipv6_range in service_ranges:
-            IPROUTE.route(
-                "add",
-                dst=ipv6_range,
-                prefsrc=random_ipv6_address,
-                gateway=default_interface_gateway,
-                oif=default_interface_index,
-                priority=1,
+    if fast:
+        # In fast mode, use batch operations for all service routes
+        routes_to_add = [
+            {
+                "dst": ipv6_range,
+                "prefsrc": random_ipv6_address,
+                "gateway": default_interface_gateway,
+                "oif": default_interface_index,
+                "priority": 1,
+            }
+            for ipv6_range in service_ranges
+        ]
+
+        if not batch_add_routes(routes_to_add):
+            clean_ranges(service_ranges, skip_root, fast_mode=fast)
+            LOGGER.error(
+                "Failed to configure the service IPv6 routes. The setup did not work!"
             )
-    except Exception as error:
-        clean_ranges(service_ranges, skip_root)
-        LOGGER.error(
-            f"Failed to configure the service IPv6 route. The setup did not work!\n"
-            f"Exception:\n{error}"
-        )
-        sys.exit()
+            sys.exit()
+    else:
+        try:
+            for ipv6_range in service_ranges:
+                IPROUTE.route(
+                    "add",
+                    dst=ipv6_range,
+                    prefsrc=random_ipv6_address,
+                    gateway=default_interface_gateway,
+                    oif=default_interface_index,
+                    priority=1,
+                )
+        except Exception as error:
+            clean_ranges(service_ranges, skip_root, fast_mode=fast)
+            LOGGER.error(
+                f"Failed to configure the service IPv6 route. The setup did not work!\n"
+                f"Exception:\n{error}"
+            )
+            sys.exit()
 
     LOGGER.info(
         f"Correctly configured the IPv6 routes for IPv6 ranges {service_ranges}.\n"
         "Successful setup. Waiting for the propagation in the Linux kernel."
     )
 
-    sleep(6)
+    if fast:
+        # In fast mode, minimal delay for kernel propagation
+        sleep(0.2)  # 200ms should be sufficient
+    else:
+        sleep(6)
 
 
 @parse_args
@@ -277,20 +335,26 @@ def clean_one(
     services: str | None = None,
     external_ipv6_ranges: str | None = None,
     no_services: bool = False,
+    fast: bool = False,
 ) -> None:
     """Clean your system for a given service / ipv6 ranges."""
 
-    clean_ranges(what_ranges(services, external_ipv6_ranges, no_services), skip_root)
+    clean_ranges(
+        what_ranges(services, external_ipv6_ranges, no_services),
+        skip_root,
+        fast_mode=fast,
+    )
 
 
 @parse_args
 def clean(
     skip_root: bool = False,
+    fast: bool = False,
 ) -> None:
     """Clean all configurations made by this script."""
 
     for config in previous_configs():
-        clean_ranges(config.ranges, skip_root)
+        clean_ranges(config.ranges, skip_root, fast_mode=fast)
 
 
 def main() -> None:
@@ -319,10 +383,16 @@ def main() -> None:
         "--interface",
         help="Specify the network interface to use.",
         required=False,
-        )
+    )
     run_parser.add_argument(
         "--gateway",
         help="Specify the IPv6 gateway to use.",
+        required=False,
+    )
+    run_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Enable aggressive optimization for faster rotation (minimal delays, active polling).",
         required=False,
     )
     run_parser.set_defaults(func=run)
@@ -332,6 +402,12 @@ def main() -> None:
     )
     for flag, config in SHARED_OPTIONS:
         clean_one_parser.add_argument(flag, **config)
+    clean_one_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use minimal delays for faster cleanup.",
+        required=False,
+    )
 
     clean_one_parser.set_defaults(func=clean_one)
 
@@ -339,6 +415,12 @@ def main() -> None:
         "clean", help="Clean all configurations made by this script."
     )
     clean_parser.add_argument("--skip-root", action="store_true")
+    clean_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use minimal delays for faster cleanup.",
+        required=False,
+    )
     clean_parser.set_defaults(func=clean)
 
     # Check if a command is being ran, otherwise print help.
