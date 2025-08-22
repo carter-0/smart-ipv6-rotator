@@ -246,7 +246,7 @@ def clean_ranges(ranges_: list[str], skip_root: bool, fast_mode: bool = False) -
     try:
         IPROUTE.addr(
             "del",
-            previous.interface_index,
+            index=previous.interface_index,
             address=previous.random_ipv6_address,
             mask=previous.random_ipv6_address_mask,
         )
