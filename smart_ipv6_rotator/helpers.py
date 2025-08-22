@@ -150,20 +150,18 @@ def wait_for_address_ready(
 
 def batch_add_routes(
     routes: list[dict],
-    commit_timeout: float = 5.0
 ) -> bool:
     """
     Add multiple routes in a single batch operation.
     
     Args:
         routes: List of route dictionaries with keys matching IPRoute.route() params
-        commit_timeout: Timeout for batch commit operation
         
     Returns:
         True if successful, False otherwise
     """
     try:
-        with IPBatch(commit_timeout=commit_timeout) as batch:
+        with IPBatch() as batch:
             for route_params in routes:
                 batch.route('add', **route_params)
         LOGGER.debug(f"Successfully added {len(routes)} routes in batch")
