@@ -16,6 +16,5 @@ IPROUTE = IPRoute()
 
 # IPv6 address flags - IFA_F_TENTATIVE indicates DAD is in progress
 IFA_F_TENTATIVE = 0x40
-IFA_FLAGS = 8  # Attribute number for flags in netlink messages
 
-__all__: list[str] = ["ICANHAZIP_IPV6_ADDRESS", "IP", "IPROUTE", "IPBatch", "IFA_F_TENTATIVE", "IFA_FLAGS"]
+__all__: list[str] = ["ICANHAZIP_IPV6_ADDRESS", "IP", "IPROUTE", "IPBatch", "IFA_F_TENTATIVE"]

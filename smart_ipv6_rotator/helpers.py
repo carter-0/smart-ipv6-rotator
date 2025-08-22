@@ -16,7 +16,6 @@ from smart_ipv6_rotator.const import (
     LOGGER,
     IPBatch,
     IFA_F_TENTATIVE,
-    IFA_FLAGS,
 )
 from smart_ipv6_rotator.models import SavedRanges
 from smart_ipv6_rotator.ranges import RANGES
@@ -121,15 +120,24 @@ def wait_for_address_ready(
             )
             
             for msg in addrs:
-                attrs = dict(msg.get('attrs', []))
-                # Check if this is our address
-                if attrs.get('IFA_ADDRESS') == ipv6_address:
-                    # Check if tentative flag is set
-                    flags = msg.get(IFA_FLAGS, 0)
-                    if not (flags & IFA_F_TENTATIVE):
-                        elapsed = monotonic() - start_time
-                        LOGGER.debug(f"Address {ipv6_address} ready after {elapsed:.2f}s")
-                        return True
+                # Check if this is a valid address message (dict)
+                if isinstance(msg, dict):
+                    # Extract address from attributes
+                    address = None
+                    attrs = msg.get('attrs', [])
+                    for attr in attrs:
+                        if attr[0] == 'IFA_ADDRESS':
+                            address = attr[1]
+                            break
+                    
+                    # Check if this is our address
+                    if address == ipv6_address:
+                        # Check if tentative flag is set
+                        flags = msg.get('flags', 0)
+                        if not (flags & IFA_F_TENTATIVE):
+                            elapsed = monotonic() - start_time
+                            LOGGER.debug(f"Address {ipv6_address} ready after {elapsed:.2f}s")
+                            return True
                         
         except Exception as e:
             LOGGER.debug(f"Error checking address status: {e}")
